@@ -1,1 +1,221 @@
+pipeline {
+    agent { label 'Jenkins-Agent' }
+
+    tools {
+        jdk 'Java17'
+        maven 'Maven3'
+        nodejs 'Node16'
+    }
+
+    environment {
+        APP_NAME      = "zomato-kastro"
+        RELEASE       = "1.0.0"
+        DOCKER_USER   = "mydockerhubuser"
+        IMAGE_NAME    = "${DOCKER_USER}/${APP_NAME}"
+        IMAGE_TAG     = "${RELEASE}-${BUILD_NUMBER}"
+        SCANNER_HOME  = tool 'sonar-scanner'
+    }
+
+    parameters {
+        choice(name: 'DEPLOY_METHOD', choices: ['k8s', 'helm', 'tomcat', 'ansible', 'canary'], description: 'Choose deployment target')
+        booleanParam(name: 'RUN_TERRAFORM', defaultValue: true, description: 'Provision infra with Terraform before deployment?')
+    }
+
+    stages {
+        stage('Cleanup Workspace') { 
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Repos') {
+            steps {
+                git branch: 'main', credentialsId: 'github', url: 'https://github.com/haridiv/DevOps-Project-Zomato-Kastro.git'
+            }
+        }
+
+        stage('Build Backend (Maven)') { 
+            steps { 
+                dir('backend') {
+                    sh "mvn clean package -B -DskipTests=false"
+                }
+            }
+        }
+
+        stage('Build Frontend (NodeJS)') {
+            steps {
+                dir('frontend') { 
+                    sh "npm install"
+                    sh "npm run build"
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh """
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                          -Dsonar.projectKey=${APP_NAME} \
+                          -Dsonar.projectName=${APP_NAME} \
+                          -Dsonar.sources=./backend,./frontend
+                    """
+                }
+            }
+        }
+
+        stage('Enforce Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: true, credentialsId: 'sonar-token' 
+                }
+            }
+        }
+
+        stage('OWASP Dependency-Check') {
+            steps {
+                dependencyCheck odcInstallation: 'DP-Check', scanpath: 'backend'
+                dependencyCheckPublisher pattern: 'dependency-check-report.xml'
+            }
+        }   
+
+        stage('TRIVY FS SCAN') {
+            steps {
+                sh 'trivy fs . --format table -o trivy-fs-report.txt'
+            }
+        }
+
+        stage('Publish to Nexus') {
+            steps {
+                dir('backend') {
+                    withMaven(globalMavenSettingsConfig: 'maven-settings', jdk: 'Java17', maven: 'Maven3') {
+                        sh "mvn deploy"
+                    }
+                }
+            }
+        }
+
+        stage('Docker Build & Tag') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'dockerhub') {
+                        sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} -f Dockerfile ."
+                        sh "docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest"
+                    }
+                }
+            }
+        }
+
+        stage("TRIVY Image Scan") {
+            steps {
+                sh "trivy image ${IMAGE_NAME}:${IMAGE_TAG} --format table -o trivy-image-report.txt" 
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                script {
+                    withDockerRegistry(credentialsId: 'dockerhub') {
+                        sh "docker push ${IMAGE_NAME}:${IMAGE_TAG}"
+                        sh "docker push ${IMAGE_NAME}:latest"
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Infra Provisioning') {
+            when { expression { return params.RUN_TERRAFORM } }
+            steps {
+                dir('terraform') {
+                    sh """
+                        terraform init
+                        terraform plan -out=tfplan
+                        terraform apply -auto-approve tfplan
+                    """
+                }
+            }
+        }
+
+        stage('Deploy - K8s Direct') {
+            when { expression { params.DEPLOY_METHOD == 'k8s' } }
+            steps {
+                withKubeConfig(credentialsId: 'k8s-cred', namespace: 'webapps', serverUrl: 'https://k8s-cluster:6443') {
+                    sh "kubectl apply -f k8s/deployment.yaml -n webapps"
+                    sh "kubectl set image deployment/${APP_NAME} ${APP_NAME}=${IMAGE_NAME}:${IMAGE_TAG} -n webapps"
+                }
+            }
+        }
+
+        stage('Deploy - Helm') {
+            when { expression { params.DEPLOY_METHOD == 'helm' } }
+            steps {
+                withKubeConfig(credentialsId: 'k8s-cred', namespace: 'webapps', serverUrl: 'https://k8s-cluster:6443') {
+                    sh """
+                        helm upgrade --install ${APP_NAME} helm/${APP_NAME} \
+                          --namespace webapps \
+                          --set image.repository=${IMAGE_NAME} \
+                          --set image.tag=${IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy - Ansible') {
+            when { expression { params.DEPLOY_METHOD == 'ansible' } }
+            steps {
+                dir('ansible') {
+                    ansiblePlaybook credentialsId: 'ssh-key',
+                                    inventory: 'inventory.ini',
+                                    playbook: 'deploy-app.yml',
+                                    disableHostKeyChecking: true
+                }
+            }
+        }
+
+        stage('Deploy - Canary (Argo Rollouts)') {
+            when { expression { params.DEPLOY_METHOD == 'canary' } }
+            steps {
+                withKubeConfig(credentialsId: 'k8s-cred', namespace: 'webapps', serverUrl: 'https://k8s-cluster:6443') {
+                    sh """
+                        kubectl apply -f argo/app-rollout.yml -n webapps
+                        kubectl argo rollouts set image ${APP_NAME}-rollout ${APP_NAME}=${IMAGE_NAME}:${IMAGE_TAG} -n webapps
+                        kubectl argo rollouts promote ${APP_NAME}-rollout -n webapps
+                    """
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                withKubeConfig(credentialsId: 'k8s-cred', namespace: 'webapps', serverUrl: 'https://k8s-cluster:6443') {
+                    sh "kubectl get pods -n webapps"
+                    sh "kubectl get svc -n webapps"
+                    if (params.DEPLOY_METHOD == 'canary') {
+                        sh "kubectl argo rollouts get rollout ${APP_NAME}-rollout -n webapps"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            emailext (
+                subject: "🚀 ${env.JOB_NAME} - Build #${BUILD_NUMBER} - ${currentBuild.result}",
+                body: """
+                <html><body>
+                <h2>Enterprise Progressive Delivery Report</h2>
+                <p><b>Project:</b> ${env.JOB_NAME}</p>
+                <p><b>Build Number:</b> ${env.BUILD_NUMBER}</p>
+                <p><b>Status:</b> ${currentBuild.result}</p>
+                <p>🌐 <a href="${env.BUILD_URL}">View Build Console</a></p>
+                </body></html>
+                """,
+                to: 'devops-team@example.com',
+                mimeType: 'text/html',
+                attachmentsPattern: 'trivy-fs-report.txt,trivy-image-report.txt,dependency-check-report.xml'
+            )
+        }
+    }
+}
 
